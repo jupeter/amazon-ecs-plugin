@@ -30,6 +30,7 @@ import java.text.MessageFormat;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Collections;
+import java.util.Comparator;
 import java.util.Date;
 import java.util.List;
 import java.util.concurrent.Callable;
@@ -50,13 +51,22 @@ import com.amazonaws.AmazonClientException;
 import com.amazonaws.regions.Region;
 import com.amazonaws.regions.RegionUtils;
 import com.amazonaws.regions.Regions;
+import com.amazonaws.services.autoscaling.AmazonAutoScalingClient;
+import com.amazonaws.services.autoscaling.model.AutoScalingGroup;
+import com.amazonaws.services.autoscaling.model.DescribeAutoScalingGroupsRequest;
+import com.amazonaws.services.autoscaling.model.DescribeAutoScalingGroupsResult;
 import com.amazonaws.services.ecs.AmazonECSClient;
+import com.amazonaws.services.ecs.model.ListClustersRequest;
+import com.amazonaws.services.ecs.model.ListClustersResult;
 import com.cloudbees.jenkins.plugins.awscredentials.AWSCredentialsHelper;
 import com.cloudbees.jenkins.plugins.awscredentials.AmazonWebServicesCredentials;
 
 import hudson.Extension;
+import hudson.init.InitMilestone;
+import hudson.init.Initializer;
 import hudson.model.Computer;
 import hudson.model.Descriptor;
+import hudson.model.Hudson;
 import hudson.model.Label;
 import hudson.model.Node;
 import hudson.slaves.Cloud;
@@ -76,6 +86,58 @@ public class ECSCloud extends Cloud {
 
     private static final int DEFAULT_SLAVE_TIMEOUT = 900;
 
+    /**
+     * Start auto scaling ECS clusters as part of Jenkins initialization.
+     *
+     * @throws InterruptedException
+     * @throws IOException
+     */
+
+    @Initializer(after = InitMilestone.JOB_LOADED)
+    public static void init() throws InterruptedException, IOException {
+        final Jenkins jenkins = Jenkins.getInstance();
+
+        // Remove all slaves that were persisted when Jenkins shutdown.
+        for (final ECSSlave ecsSlave : getSlaves()) {
+            LOGGER.log(Level.INFO, "Terminating ECS slave {0}", new Object[] {ecsSlave.getDisplayName()});
+            ecsSlave.terminate();
+        }
+
+        // Start auto scale in
+        for (final Cloud c : jenkins.clouds) {
+            if (c instanceof ECSCloud) {
+                final ECSCloud ecsCloud = (ECSCloud)c;
+                ecsCloud.startAutoScaleIn();
+            }
+        }
+    }
+
+    public static List<ECSSlave> getSlaves() {
+        final Jenkins jenkins = Jenkins.getInstance();
+        final List<ECSSlave> ecsSlaves = new ArrayList<ECSSlave>();
+        final List<Node> allSlaves = jenkins.getNodes();
+        for (final Node n : allSlaves) {
+            if (n instanceof ECSSlave) {
+                final ECSSlave ecsSlave = (ECSSlave)n;
+            }
+        }
+        return ecsSlaves;
+    }
+
+    public static List<ECSSlave> getSlavesOfCloud(final ECSCloud ecsCloud) {
+        final List<ECSSlave> resultSlaves = new ArrayList<ECSSlave>();
+        for (final ECSSlave ecsSlave : getSlaves()) {
+            if (ecsSlave.getCloud() == ecsCloud) {
+                resultSlaves.add(ecsSlave);
+            }
+        }
+        return resultSlaves;
+    }
+
+    public static ECSCloud get() {
+        return Hudson.getInstance().clouds.get(ECSCloud.class);
+    }
+
     private final List<ECSTaskTemplate> templates;
 
     /**
@@ -85,6 +147,10 @@ public class ECSCloud extends Cloud {
     private final String credentialsId;
 
     private final String cluster;
+
+    private String autoScalingGroup;
+
+    private transient Thread clusterScalerThread = null;
 
     private String regionName;
 
@@ -102,24 +168,34 @@ public class ECSCloud extends Cloud {
 
     @DataBoundConstructor
     public ECSCloud(String name, List<ECSTaskTemplate> templates, @Nonnull String credentialsId,
-            String cluster, String regionName, String jenkinsUrl, int slaveTimoutInSeconds) throws InterruptedException{
+        String cluster, String autoScalingGroup, String regionName, String jenkinsUrl, int slaveTimoutInSeconds) throws InterruptedException {
         super(name);
         this.credentialsId = credentialsId;
         this.cluster = cluster;
+        this.autoScalingGroup = autoScalingGroup;
         this.templates = templates;
         this.regionName = regionName;
-        LOGGER.log(Level.INFO, "Create cloud {0} on ECS cluster {1} on the region {2}", new Object[]{name, cluster, regionName});
+        LOGGER.log(Level.INFO, "Create ECS cloud {0} on ECS cluster {1} on the region {2}", new Object[] {name, cluster, regionName});
 
-        if(StringUtils.isNotBlank(jenkinsUrl)) {
+        if (StringUtils.isNotBlank(jenkinsUrl)) {
             this.jenkinsUrl = jenkinsUrl;
         } else {
             this.jenkinsUrl = JenkinsLocationConfiguration.get().getUrl();
         }
 
-        if(slaveTimoutInSeconds > 0) {
+        if (slaveTimoutInSeconds > 0) {
             this.slaveTimoutInSeconds = slaveTimoutInSeconds;
         } else {
             this.slaveTimoutInSeconds = DEFAULT_SLAVE_TIMEOUT;
+        }
+    }
+
+    private void startAutoScaleIn() {
+        if (!StringUtils.isEmpty(autoScalingGroup) && !StringUtils.isEmpty(cluster)) {
+            if (clusterScalerThread == null) {
+                clusterScalerThread = new Thread(new ECSClusterScaleIn(getEcsService(), cluster, autoScalingGroup));
+                clusterScalerThread.start();
+            }
         }
     }
 
@@ -144,6 +220,10 @@ public class ECSCloud extends Cloud {
 
     public String getCluster() {
         return cluster;
+    }
+
+    public String getAutoScalingGroup() {
+        return autoScalingGroup;
     }
 
     public String getRegionName() {
@@ -174,7 +254,7 @@ public class ECSCloud extends Cloud {
     }
 
     private ECSTaskTemplate getTemplate(Label label) {
-        if (label == null) {
+        if (label == null || templates == null) {
             return null;
         }
         for (ECSTaskTemplate t : templates) {
@@ -185,7 +265,6 @@ public class ECSCloud extends Cloud {
         return null;
     }
 
-
     @Override
     public Collection<NodeProvisioner.PlannedNode> provision(Label label, int excessWorkload) {
         try {
@@ -195,8 +274,7 @@ public class ECSCloud extends Cloud {
 
             for (int i = 1; i <= excessWorkload; i++) {
 
-                r.add(new NodeProvisioner.PlannedNode(template.getDisplayName(), Computer.threadPoolForRemoting
-                  .submit(new ProvisioningCallback(template, label)), 1));
+                r.add(new NodeProvisioner.PlannedNode(template.getDisplayName(), Computer.threadPoolForRemoting.submit(new ProvisioningCallback(template, label)), 1));
             }
             return r;
         } catch (Exception e) {
@@ -205,7 +283,7 @@ public class ECSCloud extends Cloud {
         }
     }
 
-     void deleteTask(String taskArn, String clusterArn) {
+    void deleteTask(String taskArn, String clusterArn) {
         getEcsService().deleteTask(taskArn, clusterArn);
     }
 
@@ -216,7 +294,6 @@ public class ECSCloud extends Cloud {
     public void setSlaveTimoutInSeconds(int slaveTimoutInSeconds) {
         this.slaveTimoutInSeconds = slaveTimoutInSeconds;
     }
-
 
     private class ProvisioningCallback implements Callable<Node> {
 
@@ -229,6 +306,7 @@ public class ECSCloud extends Cloud {
             this.label = label;
         }
 
+        @Override
         public Node call() throws Exception {
             final ECSSlave slave;
 
@@ -236,11 +314,11 @@ public class ECSCloud extends Cloud {
             Date timeout = new Date(now.getTime() + 1000 * slaveTimoutInSeconds);
 
             synchronized (cluster) {
-                getEcsService().waitForSufficientClusterResources(timeout, template, cluster);
+                getEcsService().waitForSufficientClusterResources(timeout, template, cluster, autoScalingGroup);
 
                 String uniq = Long.toHexString(System.nanoTime());
                 slave = new ECSSlave(ECSCloud.this, name + "-" + uniq, template.getRemoteFSRoot(),
-                        label == null ? null : label.toString(), new JNLPLauncher());
+                    label == null ? null : label.toString(), new JNLPLauncher());
                 slave.setClusterArn(cluster);
                 Jenkins.getInstance().addNode(slave);
                 while (Jenkins.getInstance().getNode(slave.getNodeName()) == null) {
@@ -249,10 +327,10 @@ public class ECSCloud extends Cloud {
                 LOGGER.log(Level.INFO, "Created Slave: {0}", slave.getNodeName());
 
                 try {
-                    String taskDefintionArn = getEcsService().registerTemplate(slave.getCloud(), template, cluster);
-                    String taskArn = getEcsService().runEcsTask(slave, template, cluster, getDockerRunCommand(slave), taskDefintionArn);
+                    String taskDefinitionArn = getEcsService().registerTemplate(slave.getCloud(), template, cluster);
+                    String taskArn = getEcsService().runEcsTask(slave, template, cluster, getDockerRunCommand(slave), taskDefinitionArn);
                     LOGGER.log(Level.INFO, "Slave {0} - Slave Task Started : {1}",
-                            new Object[] { slave.getNodeName(), taskArn });
+                        new Object[] {slave.getNodeName(), taskArn});
                     slave.setTaskArn(taskArn);
                 } catch (Exception ex) {
                     LOGGER.log(Level.WARNING, "Slave {0} - Cannot create ECS Task");
@@ -265,25 +343,25 @@ public class ECSCloud extends Cloud {
             while (timeout.after(new Date())) {
                 if (slave.getComputer() == null) {
                     throw new IllegalStateException(
-                            "Slave " + slave.getNodeName() + " - Node was deleted, computer is null");
+                        "Slave " + slave.getNodeName() + " - Node was deleted, computer is null");
                 }
                 if (slave.getComputer().isOnline()) {
                     break;
                 }
                 LOGGER.log(Level.FINE, "Waiting for slave {0} (ecs task {1}) to connect since {2}.",
-                        new Object[] { slave.getNodeName(), slave.getTaskArn(), now });
+                    new Object[] {slave.getNodeName(), slave.getTaskArn(), now});
                 Thread.sleep(1000);
             }
             if (!slave.getComputer().isOnline()) {
                 final String msg = MessageFormat.format("ECS Slave {0} (ecs task {1}) not connected since {2} seconds",
-                        slave.getNodeName(), slave.getTaskArn(), now);
+                    slave.getNodeName(), slave.getTaskArn(), now);
                 LOGGER.log(Level.WARNING, msg);
                 Jenkins.getInstance().removeNode(slave);
                 throw new IllegalStateException(msg);
             }
 
             LOGGER.log(Level.INFO, "ECS Slave " + slave.getNodeName() + " (ecs task {0}) connected",
-                    slave.getTaskArn());
+        	    slave.getTaskArn());
             return slave;
         }
     }
@@ -301,7 +379,6 @@ public class ECSCloud extends Cloud {
         return command;
     }
 
-
     @Extension
     public static class DescriptorImpl extends Descriptor<Cloud> {
 
@@ -318,7 +395,15 @@ public class ECSCloud extends Cloud {
 
         public ListBoxModel doFillRegionNameItems() {
             final ListBoxModel options = new ListBoxModel();
-            for (Region region : RegionUtils.getRegions()) {
+            final List<Region> allRegions = new ArrayList<Region>(RegionUtils.getRegions());
+            allRegions.sort(new Comparator<Region>() {
+
+                @Override
+                public int compare(final Region region1, final Region region2) {
+                    return region1.getName().compareTo(region2.getName());
+                }
+            });
+            for (Region region : allRegions) {
                 options.add(region.getName());
             }
             return options;
@@ -328,8 +413,17 @@ public class ECSCloud extends Cloud {
             ECSService ecsService = new ECSService(credentialsId, regionName);
             try {
                 final AmazonECSClient client = ecsService.getAmazonECSClient();
+                final List<String> allClusterArns = new ArrayList<String>();
+                String lastToken = null;
+                do {
+                    final ListClustersResult result =
+                        client.listClusters(new ListClustersRequest().withNextToken(lastToken));
+                    allClusterArns.addAll(result.getClusterArns());
+                    lastToken = result.getNextToken();
+                } while (lastToken != null);
+                Collections.sort(allClusterArns);
                 final ListBoxModel options = new ListBoxModel();
-                for (String arn : client.listClusters().getClusterArns()) {
+                for (String arn : allClusterArns) {
                     options.add(arn);
                 }
                 return options;
@@ -344,7 +438,41 @@ public class ECSCloud extends Cloud {
             }
         }
 
-        public FormValidation doCheckName(@QueryParameter String value) throws IOException, ServletException {
+        public ListBoxModel doFillAutoScalingGroupItems(@QueryParameter String credentialsId, @QueryParameter String regionName) {
+            final ECSService ecsService = new ECSService(credentialsId, regionName);
+            try {
+                final AmazonAutoScalingClient client = ecsService.getAmazonAutoScalingClient();
+                final List<AutoScalingGroup> allAutoScalingGroups = new ArrayList<AutoScalingGroup>();
+                String lastToken = null;
+                do {
+                    final DescribeAutoScalingGroupsResult res =
+                        client.describeAutoScalingGroups(new DescribeAutoScalingGroupsRequest().withNextToken(lastToken));
+                    allAutoScalingGroups.addAll(res.getAutoScalingGroups());
+                    lastToken = res.getNextToken();
+                } while (lastToken != null);
+                final List<String> allAutoScalingGroupNames = new ArrayList<String>();
+                for (final AutoScalingGroup asg : allAutoScalingGroups) {
+                    allAutoScalingGroupNames.add(asg.getAutoScalingGroupName());
+                }
+                Collections.sort(allAutoScalingGroupNames);
+                final ListBoxModel options = new ListBoxModel();
+                options.add("");
+                for (final String autoScalingGroupName : allAutoScalingGroupNames) {
+                    options.add(autoScalingGroupName);
+                }
+                return options;
+            } catch (AmazonClientException e) {
+                // missing credentials will throw an "AmazonClientException: Unable to load AWS credentials from any provider in the chain"
+                LOGGER.log(Level.INFO, "Exception searching autoscaling instances for credentials=" + credentialsId + ", regionName=" + regionName + ":" + e);
+                LOGGER.log(Level.FINE, "Exception searching autoscaling instances for credentials=" + credentialsId + ", regionName=" + regionName, e);
+                return new ListBoxModel();
+            } catch (RuntimeException e) {
+                LOGGER.log(Level.INFO, "Exception searching autoscaling instances for credentials=" + credentialsId + ", regionName=" + regionName, e);
+                return new ListBoxModel();
+            }
+        }
+
+        public FormValidation doCheckName(@QueryParameter final String value) throws IOException, ServletException {
             if (value.length() > 0 && value.length() <= 127 && value.matches(CLOUD_NAME_PATTERN)) {
                 return FormValidation.ok();
             }
