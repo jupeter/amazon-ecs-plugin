@@ -318,7 +318,7 @@ public class ECSCloud extends Cloud {
 
                 String uniq = Long.toHexString(System.nanoTime());
                 slave = new ECSSlave(ECSCloud.this, name + "-" + uniq, template.getRemoteFSRoot(),
-                    label == null ? null : label.toString(), new JNLPLauncher());
+                        template.getLabel(), new JNLPLauncher());
                 slave.setClusterArn(cluster);
                 Jenkins.getInstance().addNode(slave);
                 while (Jenkins.getInstance().getNode(slave.getNodeName()) == null) {
@@ -423,7 +423,7 @@ public class ECSCloud extends Cloud {
                 } while (lastToken != null);
                 Collections.sort(allClusterArns);
                 final ListBoxModel options = new ListBoxModel();
-                for (String arn : allClusterArns) {
+                for (final String arn : allClusterArns) {
                     options.add(arn);
                 }
                 return options;

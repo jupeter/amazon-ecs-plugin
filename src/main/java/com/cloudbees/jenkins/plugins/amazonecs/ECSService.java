@@ -86,7 +86,7 @@ import jenkins.model.Jenkins;
  * Encapsulates interactions with Amazon ECS.
  *
  * @author Jan Roehrich <jan@roehrich.info>
- * 
+ *
  */
 class ECSService {
 
@@ -219,7 +219,8 @@ class ECSService {
             .withEnvironment(template.getEnvironmentKeyValuePairs())
             .withExtraHosts(template.getExtraHostEntries())
             .withMountPoints(template.getMountPointEntries())
-            .withCpu(template.getCpu())
+            .withPortMappings(template.getPortMappingEntries())
+                .withCpu(template.getCpu())
             .withPrivileged(template.getPrivileged())
             .withEssential(true);
 
@@ -233,6 +234,9 @@ class ECSService {
         if (template.getMemory() > 0)/* this is the hard limit */
             def.withMemory(template.getMemory());
 
+        if (template.getDnsSearchDomains() != null)
+            def.withDnsSearchDomains(StringUtils.split(template.getDnsSearchDomains()));
+
         if (template.getEntrypoint() != null)
             def.withEntryPoint(StringUtils.split(template.getEntrypoint()));
 
@@ -240,6 +244,9 @@ class ECSService {
             def.withEnvironment(new KeyValuePair()
                 .withName("JAVA_OPTS").withValue(template.getJvmArgs()))
                 .withEssential(true);
+
+        if (template.getContainerUser() != null)
+            def.withUser(template.getContainerUser());
 
         if (template.getLogDriver() != null) {
             LogConfiguration logConfig = new LogConfiguration();
@@ -269,9 +276,8 @@ class ECSService {
             describeTaskDefinition = client.describeTaskDefinition(new DescribeTaskDefinitionRequest().withTaskDefinition(taskDefinitions.getLast()));
 
             templateMatchesExistingContainerDefinition = def.equals(describeTaskDefinition.getTaskDefinition().getContainerDefinitions().get(0));
-            LOGGER.log(Level.INFO, "Match on container defintion: {0}",new Object[] {templateMatchesExistingContainerDefinition});
-            LOGGER.log(Level.FINE, "Match on container defintion: {0}; template={1}; last={2}", new Object[] {templateMatchesExistingContainerDefinition, def, describeTaskDefinition.getTaskDefinition().getContainerDefinitions().get(0)});
-
+            LOGGER.log(Level.INFO, "Match on container definition: {0}",new Object[] {templateMatchesExistingContainerDefinition});
+            LOGGER.log(Level.FINE, "Match on container definition: {0}; template={1}; last={2}", new Object[] {templateMatchesExistingContainerDefinition, def, describeTaskDefinition.getTaskDefinition().getContainerDefinitions().get(0)});
             templateMatchesExistingVolumes = ObjectUtils.equals(template.getVolumeEntries(), describeTaskDefinition.getTaskDefinition().getVolumes());
             LOGGER.log(Level.INFO, "Match on volumes: {0}", new Object[] {templateMatchesExistingVolumes});
             LOGGER.log(Level.FINE, "Match on volumes: {0}; template={1}; last={2}", new Object[] {templateMatchesExistingVolumes, template.getVolumeEntries(), describeTaskDefinition.getTaskDefinition().getVolumes()});
