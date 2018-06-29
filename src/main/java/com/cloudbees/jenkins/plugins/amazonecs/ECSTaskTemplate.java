@@ -25,14 +25,17 @@
 
 package com.cloudbees.jenkins.plugins.amazonecs;
 
+import com.amazonaws.services.ecs.model.AwsVpcConfiguration;
 import com.amazonaws.services.ecs.model.ContainerDefinition;
 import com.amazonaws.services.ecs.model.HostEntry;
 import com.amazonaws.services.ecs.model.PortMapping;
 import com.amazonaws.services.ecs.model.Volume;
 import com.amazonaws.services.ecs.model.HostVolumeProperties;
-import com.amazonaws.services.ecs.model.MountPoint;
 import com.amazonaws.services.ecs.model.KeyValuePair;
+import com.amazonaws.services.ecs.model.LaunchType;
+import com.amazonaws.services.ecs.model.MountPoint;
 import com.amazonaws.services.ecs.model.RegisterTaskDefinitionRequest;
+import com.amazonaws.services.ecs.model.Volume;
 import hudson.Extension;
 import hudson.model.AbstractDescribableImpl;
 import hudson.model.Descriptor;
@@ -41,6 +44,7 @@ import hudson.model.labels.LabelAtom;
 import hudson.util.FormValidation;
 import hudson.util.ListBoxModel;
 
+import hudson.util.ListBoxModel;
 import org.apache.commons.lang.StringUtils;
 import org.kohsuke.stapler.DataBoundConstructor;
 import org.kohsuke.stapler.DataBoundSetter;
@@ -58,7 +62,6 @@ import java.util.*;
  * @author <a href="mailto:nicolas.deloof@gmail.com">Nicolas De Loof</a>
  */
 public class ECSTaskTemplate extends AbstractDescribableImpl<ECSTaskTemplate> {
-
     /**
      * Template Name
      */
@@ -71,6 +74,13 @@ public class ECSTaskTemplate extends AbstractDescribableImpl<ECSTaskTemplate> {
      */
     @CheckForNull
     private final String label;
+
+    /**
+     * Task Definition Override to use, instead of a Jenkins-managed Task definition. May be a family name or an ARN.
+     */
+    @CheckForNull
+    private final String taskDefinitionOverride;
+
     /**
      * Docker image
      * @see ContainerDefinition#withImage(String)
@@ -123,6 +133,27 @@ public class ECSTaskTemplate extends AbstractDescribableImpl<ECSTaskTemplate> {
     private final int cpu;
 
     /**
+     * Subnets to be assigned on the awsvpc network when using Fargate
+     *
+     * @see AwsVpcConfiguration#setSubnets(Collection)
+     */
+    private String subnets;
+
+    /**
+     * Security groups to be assigned on the awsvpc network when using Fargate
+     *
+     * @see AwsVpcConfiguration#setSecurityGroups(Collection)
+     */
+    private String securityGroups;
+
+    /**
+     * Assign a public Ip to instance on awsvpc network when using Fargate
+     *
+     * @see AwsVpcConfiguration#setAssignPublicIp(String)
+     */
+    private boolean assignPublicIp;
+
+    /**
      * Space delimited list of Docker dns search domains
      *
      * @see ContainerDefinition#withDnsSearchDomains(Collection)
@@ -145,6 +176,15 @@ public class ECSTaskTemplate extends AbstractDescribableImpl<ECSTaskTemplate> {
      */
     @CheckForNull
     private String taskrole;
+
+    /**
+     * ARN of the IAM role to use for the slave ECS task
+     *
+     * @see RegisterTaskDefinitionRequest#withExecutionRoleArn(String)
+     */
+    @CheckForNull
+    private String executionRole;
+
     /**
       JVM arguments to start slave.jar
      */
@@ -155,6 +195,12 @@ public class ECSTaskTemplate extends AbstractDescribableImpl<ECSTaskTemplate> {
       Container mount points, imported from volumes
      */
     private List<MountPointEntry> mountPoints;
+
+    /**
+     * Task launch type
+     */
+    @Nonnull
+    private final String launchType;
 
     /**
      * Indicates whether the container should run in privileged mode
@@ -194,11 +240,16 @@ public class ECSTaskTemplate extends AbstractDescribableImpl<ECSTaskTemplate> {
     @DataBoundConstructor
     public ECSTaskTemplate(@Nonnull String templateName,
                            @Nullable String label,
+                           @Nullable String taskDefinitionOverride,
                            @Nonnull String image,
+                           @Nonnull String launchType,
                            @Nullable String remoteFSRoot,
                            int memory,
                            int memoryReservation,
                            int cpu,
+                           @Nullable String subnets,
+                           @Nullable String securityGroups,
+                           boolean assignPublicIp,
                            boolean privileged,
                            @Nullable String containerUser,
                            @Nullable List<LogDriverOption> logDriverOptions,
@@ -206,16 +257,31 @@ public class ECSTaskTemplate extends AbstractDescribableImpl<ECSTaskTemplate> {
                            @Nullable List<ExtraHostEntry> extraHosts,
                            @Nullable List<MountPointEntry> mountPoints,
                            @Nullable List<PortMappingEntry> portMappings) {
-        // If the template name is empty we will add a default name and a
-        // random element that will help to find it later when we want to delete it.
-        this.templateName = templateName.isEmpty() ?
-                "jenkinsTask-" + UUID.randomUUID().toString() : templateName;
+        // if the user enters a task definition override, always prefer to use it, rather than the jenkins template.
+        if (taskDefinitionOverride != null && !taskDefinitionOverride.trim().isEmpty()) {
+            this.taskDefinitionOverride = taskDefinitionOverride.trim();
+            // Always set the template name to the empty string if we are using a task definition override,
+            // since we don't want Jenkins to touch our definitions.
+            this.templateName = "";
+        } else {
+            // If the template name is empty we will add a default name and a
+            // random element that will help to find it later when we want to delete it.
+            this.templateName = templateName.isEmpty() ?
+                    "jenkinsTask-" + UUID.randomUUID().toString() : templateName;
+            // Make sure we don't have both a template name and a task definition override.
+            this.taskDefinitionOverride = null;
+        }
+
         this.label = label;
         this.image = image;
         this.remoteFSRoot = remoteFSRoot;
         this.memory = memory;
         this.memoryReservation = memoryReservation;
         this.cpu = cpu;
+        this.launchType = launchType;
+        this.subnets = subnets;
+        this.securityGroups = securityGroups;
+        this.assignPublicIp = assignPublicIp;
         this.privileged = privileged;
         this.containerUser = StringUtils.trimToNull(containerUser);
         this.logDriverOptions = logDriverOptions;
@@ -228,6 +294,11 @@ public class ECSTaskTemplate extends AbstractDescribableImpl<ECSTaskTemplate> {
     @DataBoundSetter
     public void setTaskrole(String taskRoleArn) {
         this.taskrole = StringUtils.trimToNull(taskRoleArn);
+    }
+
+    @DataBoundSetter
+    public void setExecutionRole(String executionRole) {
+        this.executionRole = StringUtils.trimToNull(executionRole);
     }
 
     @DataBoundSetter
@@ -251,12 +322,26 @@ public class ECSTaskTemplate extends AbstractDescribableImpl<ECSTaskTemplate> {
     }
 
     @DataBoundSetter
+    public void setSubnets(String subnets) { this.subnets = StringUtils.trimToNull(subnets); }
+
+    @DataBoundSetter
+    public void setSecurityGroups(String securityGroups) { this.securityGroups = StringUtils.trimToNull(securityGroups); }
+
+    @DataBoundSetter
     public void setDnsSearchDomains(String dnsSearchDomains) {
         this.dnsSearchDomains = StringUtils.trimToNull(dnsSearchDomains);
     }
 
+    public boolean isFargate() {
+        return StringUtils.trimToNull(this.launchType) != null && launchType.equals(LaunchType.FARGATE.toString());
+    }
+
     public String getLabel() {
         return label;
+    }
+
+    public String getTaskDefinitionOverride() {
+        return taskDefinitionOverride;
     }
 
     public String getImage() {
@@ -279,6 +364,18 @@ public class ECSTaskTemplate extends AbstractDescribableImpl<ECSTaskTemplate> {
         return cpu;
     }
 
+    public String getSubnets() {
+        return subnets;
+    }
+
+    public String getSecurityGroups() {
+        return securityGroups;
+    }
+
+    public boolean getAssignPublicIp() {
+        return assignPublicIp;
+    }
+
     public String getDnsSearchDomains() {
         return dnsSearchDomains;
     }
@@ -291,6 +388,10 @@ public class ECSTaskTemplate extends AbstractDescribableImpl<ECSTaskTemplate> {
         return taskrole;
     }
 
+    public String getExecutionRole() {
+        return executionRole;
+    }
+
     public String getJvmArgs() {
         return jvmArgs;
     }
@@ -301,6 +402,13 @@ public class ECSTaskTemplate extends AbstractDescribableImpl<ECSTaskTemplate> {
 
     public String getContainerUser() {
         return containerUser;
+    }
+
+    public String getLaunchType() {
+        if (StringUtils.trimToNull(this.launchType) == null) {
+            return LaunchType.EC2.toString();
+        }
+        return launchType;
     }
 
     public String getLogDriver() {
@@ -556,7 +664,7 @@ public class ECSTaskTemplate extends AbstractDescribableImpl<ECSTaskTemplate> {
                 options.add("UDP", "udp");
                 return options;
             }
-            
+
             @Override
             public String getDisplayName() {
                 return "PortMappingEntry";
@@ -582,11 +690,26 @@ public class ECSTaskTemplate extends AbstractDescribableImpl<ECSTaskTemplate> {
             return Messages.Template();
         }
 
+        public ListBoxModel doFillLaunchTypeItems() {
+            final ListBoxModel options = new ListBoxModel();
+            for (LaunchType launchType: LaunchType.values()) {
+                options.add(launchType.toString());
+            }
+            return options;
+        }
+
         public FormValidation doCheckTemplateName(@QueryParameter String value) throws IOException, ServletException {
             if (value.length() > 0 && value.length() <= 127 && value.matches(TEMPLATE_NAME_PATTERN)) {
                 return FormValidation.ok();
             }
             return FormValidation.error("Up to 127 letters (uppercase and lowercase), numbers, hyphens, and underscores are allowed");
+        }
+
+        public FormValidation doCheckSubnets(@QueryParameter("subnets") String subnets, @QueryParameter("launchType") String launchType) throws IOException, ServletException {
+            if (launchType.equals("FARGATE") && subnets.isEmpty()) {
+                return FormValidation.error("Subnets need to be set, when using FARGATE");
+            }
+            return FormValidation.ok();
         }
 
         /* we validate both memory and memoryReservation fields to the same rules */

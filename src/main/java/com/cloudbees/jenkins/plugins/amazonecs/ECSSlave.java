@@ -35,6 +35,7 @@ import javax.annotation.concurrent.GuardedBy;
 
 import hudson.model.Descriptor;
 import hudson.model.TaskListener;
+import hudson.node_monitors.ResponseTimeMonitor;
 import hudson.slaves.AbstractCloudComputer;
 import hudson.slaves.AbstractCloudSlave;
 import hudson.slaves.ComputerLauncher;
@@ -44,6 +45,8 @@ import java.util.logging.Level;
 import java.util.logging.Logger;
 
 /**
+ * This slave should only handle a single task and then be shutdown.
+ *
  * @author <a href="mailto:nicolas.deloof@gmail.com">Nicolas De Loof</a>
  */
 public class ECSSlave extends AbstractCloudSlave {
@@ -76,8 +79,24 @@ public class ECSSlave extends AbstractCloudSlave {
         @Override
         @GuardedBy("hudson.model.Queue.lock")
         public long check(ECSComputer c) {
+            LOGGER.log(Level.FINE, "Checking computer: {0}", c);
+
             AbstractCloudSlave node = c.getNode();
-            if(!c.isAcceptingTasks() && node != null) {
+
+            // If the computer is NOT idle, then it is currently running some task.
+            // In this case, we are going to tell Jenkins that it can no longer accept
+            // any new tasks, which will cause it to create a new node for any subsequent
+            // tasks.
+            if(!c.isIdle() ) {
+                LOGGER.log(Level.FINE, "Computer is not idle; setting it to no longer accept tasks.");
+                c.setAcceptingTasks( false );
+            }
+
+            // If the computer IS idle AND it is no longer accepting tasks, then it has
+            // already had a task and completed it.  In this case, we are going to terminate
+            // the node.
+            if(c.isIdle() && !c.isAcceptingTasks() && node != null) {
+                LOGGER.log(Level.FINE, "Computer is idle and not accepting tasks; terminating it.");
                 try {
                     node.terminate();
                 } catch (InterruptedException e) {
@@ -86,6 +105,21 @@ public class ECSSlave extends AbstractCloudSlave {
                     LOGGER.log(Level.WARNING, "Failed to terminate " + c.getName(), e);
                 }
             }
+
+            // If the Response Time Monitor has marked this computer as not responding, then
+            // we are going to terminate the node to free up resources.
+            if (c.getOfflineCause() instanceof ResponseTimeMonitor.Data && node != null) {
+                LOGGER.log(Level.FINE, "Computer is not responding; terminating it");
+                try {
+                    node.terminate();
+                } catch (InterruptedException e) {
+                    LOGGER.log(Level.WARNING, "Failed to terminate " + c.getName(), e);
+                } catch (IOException e) {
+                    LOGGER.log(Level.WARNING, "Failed to terminate " + c.getName(), e);
+                }
+            }
+
+            // Tell Jenkins to check again in 1 minute.
             return 1;
         }
 

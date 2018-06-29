@@ -42,6 +42,7 @@ import javax.annotation.Nonnull;
 import javax.annotation.Nullable;
 import javax.servlet.ServletException;
 
+import com.amazonaws.services.ecs.model.TaskDefinition;
 import org.apache.commons.lang.StringUtils;
 import org.kohsuke.stapler.DataBoundConstructor;
 import org.kohsuke.stapler.DataBoundSetter;
@@ -210,8 +211,9 @@ public class ECSCloud extends Cloud {
         return getEcsService().getAmazonECSClient();
     }
 
+    @Nonnull
     public List<ECSTaskTemplate> getTemplates() {
-        return templates;
+        return templates != null ? templates : Collections.<ECSTaskTemplate> emptyList();
     }
 
     public String getCredentialsId() {
@@ -257,7 +259,7 @@ public class ECSCloud extends Cloud {
         if (label == null || templates == null) {
             return null;
         }
-        for (ECSTaskTemplate t : templates) {
+        for (ECSTaskTemplate t : getTemplates()) {
             if (label.matches(t.getLabelSet())) {
                 return t;
             }
@@ -268,11 +270,13 @@ public class ECSCloud extends Cloud {
     @Override
     public Collection<NodeProvisioner.PlannedNode> provision(Label label, int excessWorkload) {
         try {
+			LOGGER.log(Level.INFO, "Asked to provision {0} slave(s) for: {1}", new Object[]{excessWorkload, label});
 
             List<NodeProvisioner.PlannedNode> r = new ArrayList<NodeProvisioner.PlannedNode>();
             final ECSTaskTemplate template = getTemplate(label);
 
             for (int i = 1; i <= excessWorkload; i++) {
+				LOGGER.log(Level.INFO, "Will provision {0}, for label: {1}", new Object[]{template.getDisplayName(), label} );
 
                 r.add(new NodeProvisioner.PlannedNode(template.getDisplayName(), Computer.threadPoolForRemoting.submit(new ProvisioningCallback(template, label)), 1));
             }
@@ -314,7 +318,10 @@ public class ECSCloud extends Cloud {
             Date timeout = new Date(now.getTime() + 1000 * slaveTimoutInSeconds);
 
             synchronized (cluster) {
-                getEcsService().waitForSufficientClusterResources(timeout, template, cluster, autoScalingGroup);
+                if (!template.isFargate()){
+                    getEcsService().waitForSufficientClusterResources(timeout, template, cluster, autoScalingGroup);
+                }
+
 
                 String uniq = Long.toHexString(System.nanoTime());
                 slave = new ECSSlave(ECSCloud.this, name + "-" + uniq, template.getRemoteFSRoot(),
@@ -327,8 +334,24 @@ public class ECSCloud extends Cloud {
                 LOGGER.log(Level.INFO, "Created Slave: {0}", slave.getNodeName());
 
                 try {
-                    String taskDefinitionArn = getEcsService().registerTemplate(slave.getCloud(), template, cluster);
-                    String taskArn = getEcsService().runEcsTask(slave, template, cluster, getDockerRunCommand(slave), taskDefinitionArn);
+                    TaskDefinition taskDefinition;
+
+                    if (template.getTaskDefinitionOverride() == null) {
+                        taskDefinition = getEcsService().registerTemplate(slave.getCloud(), template);
+                    } else {
+                        LOGGER.log(Level.FINE, "Attempting to find task definition family or ARN: {0}", template.getTaskDefinitionOverride());
+
+                        taskDefinition = getEcsService().findTaskDefinition(template.getTaskDefinitionOverride());
+                        if (taskDefinition == null) {
+                            throw new RuntimeException("Could not find task definition family or ARN: " + template.getTaskDefinitionOverride());
+                        }
+
+                        LOGGER.log(Level.FINE, "Found task definition: {0}", taskDefinition.getTaskDefinitionArn());
+                    }
+
+                    LOGGER.log(Level.INFO, "Running task definition {0} on slave {1}", new Object[]{taskDefinition.getTaskDefinitionArn(), slave.getNodeName()});
+
+                    String taskArn = getEcsService().runEcsTask(slave, template, cluster, getDockerRunCommand(slave), taskDefinition);
                     LOGGER.log(Level.INFO, "Slave {0} - Slave Task Started : {1}",
                         new Object[] {slave.getNodeName(), taskArn});
                     slave.setTaskArn(taskArn);
