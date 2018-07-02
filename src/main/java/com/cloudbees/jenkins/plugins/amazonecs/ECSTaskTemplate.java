@@ -35,7 +35,6 @@ import com.amazonaws.services.ecs.model.KeyValuePair;
 import com.amazonaws.services.ecs.model.LaunchType;
 import com.amazonaws.services.ecs.model.MountPoint;
 import com.amazonaws.services.ecs.model.RegisterTaskDefinitionRequest;
-import com.amazonaws.services.ecs.model.Volume;
 import hudson.Extension;
 import hudson.model.AbstractDescribableImpl;
 import hudson.model.Descriptor;
@@ -44,7 +43,6 @@ import hudson.model.labels.LabelAtom;
 import hudson.util.FormValidation;
 import hudson.util.ListBoxModel;
 
-import hudson.util.ListBoxModel;
 import org.apache.commons.lang.StringUtils;
 import org.kohsuke.stapler.DataBoundConstructor;
 import org.kohsuke.stapler.DataBoundSetter;
@@ -111,6 +109,13 @@ public class ECSTaskTemplate extends AbstractDescribableImpl<ECSTaskTemplate> {
      * @see ContainerDefinition#withMemoryReservation(Integer)
      */
     private final int memoryReservation;
+
+    /**
+     * The shared memory size (in MiB).
+     *
+     */
+    private final int sharedMemory;
+
 
     /* a hint to ECSService regarding whether it can ask AWS to make a new container or not */
     public int getMemoryConstraint() {
@@ -246,6 +251,7 @@ public class ECSTaskTemplate extends AbstractDescribableImpl<ECSTaskTemplate> {
                            @Nullable String remoteFSRoot,
                            int memory,
                            int memoryReservation,
+                           @Nullable int sharedMemory,
                            int cpu,
                            @Nullable String subnets,
                            @Nullable String securityGroups,
@@ -277,6 +283,7 @@ public class ECSTaskTemplate extends AbstractDescribableImpl<ECSTaskTemplate> {
         this.remoteFSRoot = remoteFSRoot;
         this.memory = memory;
         this.memoryReservation = memoryReservation;
+        this.sharedMemory = sharedMemory;
         this.cpu = cpu;
         this.launchType = launchType;
         this.subnets = subnets;
@@ -358,6 +365,10 @@ public class ECSTaskTemplate extends AbstractDescribableImpl<ECSTaskTemplate> {
 
     public int getMemoryReservation() {
         return memoryReservation;
+    }
+
+    public int getSharedMemory() {
+        return sharedMemory;
     }
 
     public int getCpu() {
